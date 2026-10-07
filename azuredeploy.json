@@ -1,0 +1,330 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "type": "string"
+    },
+    "prefix": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 20
+    },
+    "sshPublicKey": {
+      "type": "secureString"
+    },
+    "targetFqdn": {
+      "type": "string"
+    },
+    "targetIPv4": {
+      "type": "string"
+    },
+    "targetPort": {
+      "type": "int",
+      "minValue": 1,
+      "maxValue": 65535
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_D2als_v7"
+    }
+  },
+  "variables": {
+    "vnetName": "[format('{0}-vnet', parameters('prefix'))]",
+    "loadBalancerSubnetName": "load-balancer",
+    "relaySubnetName": "relay",
+    "privateLinkServiceSubnetName": "private-link-service",
+    "nsgName": "[format('{0}-nsg', parameters('prefix'))]",
+    "publicIpName": "[format('{0}-vm-pip', parameters('prefix'))]",
+    "loadBalancerName": "[format('{0}-ilb', parameters('prefix'))]",
+    "frontendName": "frontend",
+    "backendPoolName": "backend",
+    "probeName": "target-port",
+    "nicName": "[format('{0}-nic', parameters('prefix'))]",
+    "vmName": "[format('{0}-vm', parameters('prefix'))]",
+    "privateLinkServiceName": "[format('{0}-pls', parameters('prefix'))]",
+    "loadBalancerSubnetId": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('loadBalancerSubnetName'))]",
+    "relaySubnetId": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('relaySubnetName'))]",
+    "privateLinkServiceSubnetId": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('privateLinkServiceSubnetName'))]",
+    "frontendId": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('loadBalancerName'), variables('frontendName'))]",
+    "backendPoolId": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('loadBalancerName'), variables('backendPoolName'))]",
+    "cloudInit": "[format('#cloud-config\nwrite_files:\n  - path: /etc/sysctl.d/99-fabric-relay.conf\n    permissions: ''0644''\n    content: |\n      net.ipv4.ip_forward=1\n  - path: /usr/local/sbin/configure-fabric-relay.sh\n    permissions: ''0755''\n    content: |\n      #!/bin/sh\n      set -eu\n      iptables -t nat -C PREROUTING -p tcp --dport {1} -j DNAT --to-destination {0}:{1} 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport {1} -j DNAT --to-destination {0}:{1}\n      iptables -t nat -C POSTROUTING -p tcp -d {0} --dport {1} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -p tcp -d {0} --dport {1} -j MASQUERADE\n      iptables -C FORWARD -p tcp -d {0} --dport {1} -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -p tcp -d {0} --dport {1} -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT\n      iptables -C FORWARD -p tcp -s {0} --sport {1} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -p tcp -s {0} --sport {1} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n  - path: /etc/systemd/system/fabric-relay.service\n    permissions: ''0644''\n    content: |\n      [Unit]\n      Description=Fabric Private Link kernel relay rules\n      After=network-online.target\n      Wants=network-online.target\n\n      [Service]\n      Type=oneshot\n      ExecStart=/usr/local/sbin/configure-fabric-relay.sh\n      RemainAfterExit=yes\n\n      [Install]\n      WantedBy=multi-user.target\nruncmd:\n  - sysctl --system\n  - systemctl daemon-reload\n  - systemctl enable --now fabric-relay.service\n', parameters('targetIPv4'), parameters('targetPort'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('nsgName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "securityRules": []
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('vnetName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "10.60.0.0/24"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "[variables('loadBalancerSubnetName')]",
+            "properties": {
+              "addressPrefix": "10.60.0.0/27"
+            }
+          },
+          {
+            "name": "[variables('relaySubnetName')]",
+            "properties": {
+              "addressPrefix": "10.60.0.32/27"
+            }
+          },
+          {
+            "name": "[variables('privateLinkServiceSubnetName')]",
+            "properties": {
+              "addressPrefix": "10.60.0.64/27",
+              "privateLinkServiceNetworkPolicies": "Disabled"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('publicIpName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "publicIPAddressVersion": "IPv4"
+      }
+    },
+    {
+      "type": "Microsoft.Network/loadBalancers",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('loadBalancerName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+      ],
+      "sku": {
+        "name": "Standard"
+      },
+      "properties": {
+        "frontendIPConfigurations": [
+          {
+            "name": "[variables('frontendName')]",
+            "properties": {
+              "privateIPAddress": "10.60.0.10",
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddressVersion": "IPv4",
+              "subnet": {
+                "id": "[variables('loadBalancerSubnetId')]"
+              }
+            }
+          }
+        ],
+        "backendAddressPools": [
+          {
+            "name": "[variables('backendPoolName')]"
+          }
+        ],
+        "probes": [
+          {
+            "name": "[variables('probeName')]",
+            "properties": {
+              "protocol": "Tcp",
+              "port": "[parameters('targetPort')]",
+              "intervalInSeconds": 5,
+              "numberOfProbes": 2
+            }
+          }
+        ],
+        "loadBalancingRules": [
+          {
+            "name": "target-port",
+            "properties": {
+              "protocol": "Tcp",
+              "frontendPort": "[parameters('targetPort')]",
+              "backendPort": "[parameters('targetPort')]",
+              "idleTimeoutInMinutes": 15,
+              "enableFloatingIP": false,
+              "disableOutboundSnat": true,
+              "frontendIPConfiguration": {
+                "id": "[variables('frontendId')]"
+              },
+              "backendAddressPool": {
+                "id": "[variables('backendPoolId')]"
+              },
+              "probe": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/probes', variables('loadBalancerName'), variables('probeName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('nicName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/loadBalancers', variables('loadBalancerName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]",
+        "[resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName'))]"
+      ],
+      "properties": {
+        "enableIPForwarding": true,
+        "networkSecurityGroup": {
+          "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+        },
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "primary": true,
+              "privateIPAllocationMethod": "Dynamic",
+              "privateIPAddressVersion": "IPv4",
+              "subnet": {
+                "id": "[variables('relaySubnetId')]"
+              },
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName'))]"
+              },
+              "loadBalancerBackendAddressPools": [
+                {
+                  "id": "[variables('backendPoolId')]"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2024-07-01",
+      "name": "[variables('vmName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "osProfile": {
+          "computerName": "relayvm",
+          "adminUsername": "azureuser",
+          "customData": "[base64(variables('cloudInit'))]",
+          "linuxConfiguration": {
+            "disablePasswordAuthentication": true,
+            "ssh": {
+              "publicKeys": [
+                {
+                  "path": "/home/azureuser/.ssh/authorized_keys",
+                  "keyData": "[parameters('sshPublicKey')]"
+                }
+              ]
+            }
+          }
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "Canonical",
+            "offer": "0001-com-ubuntu-server-jammy",
+            "sku": "22_04-lts-gen2",
+            "version": "latest"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "managedDisk": {
+              "storageAccountType": "Standard_LRS"
+            }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/privateLinkServices",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('privateLinkServiceName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/loadBalancers', variables('loadBalancerName'))]"
+      ],
+      "properties": {
+        "enableProxyProtocol": false,
+        "loadBalancerFrontendIpConfigurations": [
+          {
+            "id": "[variables('frontendId')]"
+          }
+        ],
+        "ipConfigurations": [
+          {
+            "name": "pls-ipconfig",
+            "properties": {
+              "primary": true,
+              "privateIPAllocationMethod": "Dynamic",
+              "privateIPAddressVersion": "IPv4",
+              "subnet": {
+                "id": "[variables('privateLinkServiceSubnetId')]"
+              }
+            }
+          }
+        ],
+        "visibility": {
+          "subscriptions": [
+            "*"
+          ]
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "privateLinkServiceId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Network/privateLinkServices', variables('privateLinkServiceName'))]"
+    },
+    "privateLinkServiceName": {
+      "type": "string",
+      "value": "[variables('privateLinkServiceName')]"
+    },
+    "relayPublicIp": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName')), '2024-05-01').ipAddress]"
+    },
+    "internalLoadBalancerIp": {
+      "type": "string",
+      "value": "10.60.0.10"
+    },
+    "targetFqdn": {
+      "type": "string",
+      "value": "[parameters('targetFqdn')]"
+    },
+    "targetIPv4": {
+      "type": "string",
+      "value": "[parameters('targetIPv4')]"
+    },
+    "targetPort": {
+      "type": "int",
+      "value": "[parameters('targetPort')]"
+    }
+  }
+}
